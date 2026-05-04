@@ -85,7 +85,7 @@
 
       <%= render "posts/partials/show/content/toolbar", post: @post %>
 
-      <% if @post.file_ext.in?(%w[png jpg jpeg]) %>
+      <% if @post.file_ext.in?(%w[png jpg jpeg webp]) %>
         <div id="gen-info-container" class="styled-dtext"></div>
       <% end %>
 

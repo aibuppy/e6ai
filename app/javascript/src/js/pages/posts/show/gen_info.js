@@ -2,16 +2,12 @@
  * GenInfo Extractor
  *
  * Extracts generation parameters from image files:
- * - PNG: tEXt chunks (pnginfo)
+ * - PNG: tEXt and zTXt chunks (pnginfo)
  * - JPEG: EXIF UserComment (piexif unicode encoding)
- *
- * Uses HTTP Range requests to fetch only the header portion of the file.
+ * - Reforge "stealth pnginfo" in PNG/WEBP pixel LSBs (alpha or RGB channels)
  */
 
 const GenInfo = {};
-
-// Maximum bytes to fetch (32KB should cover metadata before image data)
-const MAX_FETCH_BYTES = 32 * 1024;
 
 // PNG signature: 0x89 P N G \r \n 0x1A \n
 const PNG_SIGNATURE = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -21,41 +17,38 @@ const EXIF_IFD_TAG = 0x8769;
 const USER_COMMENT_TAG = 0x9286;
 
 /**
- * Parse PNG chunks from an ArrayBuffer
- * Stops when it hits IDAT (image data) since metadata comes before that
+ * Parse PNG tEXt and zTXt chunks from an ArrayBuffer.
  */
-GenInfo.parsePngChunks = function (buffer) {
+GenInfo.parsePngChunks = async function (buffer) {
   const view = new DataView(buffer);
   const chunks = [];
 
   // Verify PNG signature
   for (let i = 0; i < PNG_SIGNATURE.length; i++) {
     if (view.getUint8(i) !== PNG_SIGNATURE[i]) {
-      throw new Error("Not a valid PNG file");
+      return [];
     }
   }
 
+  const latin1 = new TextDecoder("latin1");
   let offset = 8; // Skip signature
 
-  while (offset < buffer.byteLength - 12) { // Need at least 12 bytes for a chunk
+  while (offset < buffer.byteLength - 12) {
     const length = view.getUint32(offset);
     const typeBytes = new Uint8Array(buffer, offset + 4, 4);
     const type = String.fromCharCode(...typeBytes);
 
-    // Stop at IDAT - we've got all the metadata
-    if (type === "IDAT") {
-      break;
-    }
-
-    // Extract tEXt chunks
-    if (type === "tEXt") {
+    if (type === "tEXt" || type === "zTXt") {
       const data = new Uint8Array(buffer, offset + 8, Math.min(length, buffer.byteLength - offset - 12));
       const nullIndex = data.indexOf(0);
       if (nullIndex !== -1) {
-        chunks.push({
-          keyword: GenInfo.decodeText(data.slice(0, nullIndex)),
-          text: GenInfo.decodeText(data.slice(nullIndex + 1)),
-        });
+        const keyword = latin1.decode(data.subarray(0, nullIndex));
+        let text = data.subarray(nullIndex + 1);
+        if (type === "zTXt") {
+          // Skip compression method byte (always 0 = deflate), then decompress
+          text = await GenInfo.inflate(text.subarray(1));
+        }
+        chunks.push({ keyword, text: latin1.decode(text) });
       }
     }
 
@@ -166,36 +159,159 @@ GenInfo.parseExifUserComment = function (buffer, tiffStart) {
 };
 
 /**
- * Decode bytes to string
+ * Decompress deflate/zlib data using the browser's DecompressionStream.
  */
-GenInfo.decodeText = function (bytes) {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    return new TextDecoder("latin1").decode(bytes);
-  }
+GenInfo.inflate = async function (data) {
+  const blob = new Blob([data]);
+  const stream = blob.stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 };
 
 /**
- * Fetch image metadata using Range request
+ * Decompress gzip data using the browser's DecompressionStream.
+ */
+GenInfo.gunzip = async function (data) {
+  const blob = new Blob([data]);
+  const stream = blob.stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+};
+
+/**
+ * Read bytes from pixel LSBs in column-major order (x outer, y inner).
+ *
+ * mode "alpha": 1 bit per pixel from alpha LSB
+ * mode "rgb":   3 bits per pixel from R, G, B LSBs
+ */
+GenInfo.readLSBBytes = function (imageData, mode, byteCount) {
+  const { data, width, height } = imageData;
+  const out = new Uint8Array(byteCount);
+  let buffer = 0;
+  let bitCount = 0;
+  let byteIndex = 0;
+
+  for (let x = 0; x < width && byteIndex < byteCount; x++) {
+    for (let y = 0; y < height && byteIndex < byteCount; y++) {
+      const i = (y * width + x) * 4;
+
+      if (mode === "alpha") {
+        buffer = (buffer << 1) | (data[i + 3] & 1);
+        bitCount += 1;
+      } else {
+        buffer = (buffer << 1) | (data[i] & 1);
+        buffer = (buffer << 1) | (data[i + 1] & 1);
+        buffer = (buffer << 1) | (data[i + 2] & 1);
+        bitCount += 3;
+      }
+
+      while (bitCount >= 8 && byteIndex < byteCount) {
+        bitCount -= 8;
+        out[byteIndex++] = (buffer >> bitCount) & 0xFF;
+      }
+    }
+  }
+
+  return out;
+};
+
+/**
+ * Try to decode stealth data from one channel (alpha or rgb).
+ * Returns {keyword, text} or null if no valid signature found.
+ *
+ * Reference: https://github.com/Panchovix/stable-diffusion-webui-reForge/blob/739b2e1d/modules/stealth_infotext.py
+ */
+GenInfo.tryDecodeStealth = async function (imageData, mode) {
+  const SIGNATURE_LEN = 15; // "stealth_pnginfo".length
+  const signatures = mode === "alpha"
+    ? { plain: "stealth_pnginfo", compressed: "stealth_pngcomp" }
+    : { plain: "stealth_rgbinfo", compressed: "stealth_rgbcomp" };
+
+  // Read signature (15 bytes) + length field (4 bytes)
+  const header = GenInfo.readLSBBytes(imageData, mode, SIGNATURE_LEN + 4);
+  const sig = new TextDecoder("utf-8").decode(header.subarray(0, SIGNATURE_LEN));
+
+  const compressed = sig === signatures.compressed;
+  if (!compressed && sig !== signatures.plain) return null;
+
+  // Length field is payload size in bits
+  const payloadBits = new DataView(header.buffer).getInt32(SIGNATURE_LEN);
+  const payloadBytes = Math.floor(payloadBits / 8);
+  if (payloadBytes <= 0) return null;
+
+  // Read full data: signature + length + payload
+  const totalBytes = SIGNATURE_LEN + 4 + payloadBytes;
+  const allData = GenInfo.readLSBBytes(imageData, mode, totalBytes);
+  let payload = allData.subarray(SIGNATURE_LEN + 4);
+
+  if (compressed) {
+    payload = await GenInfo.gunzip(payload);
+  }
+
+  return {
+    keyword: `stealth (${mode})`,
+    text: new TextDecoder("utf-8").decode(payload),
+  };
+};
+
+/**
+ * Decode reForge "stealth pnginfo" from pixel LSBs.
+ * Tries both alpha and RGB channels independently.
+ */
+GenInfo.decodeStealthData = async function (blob) {
+  const bitmap = await createImageBitmap(blob, { colorSpaceConversion: "none" });
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  const results = [];
+  for (const mode of ["alpha", "rgb"]) {
+    try {
+      const result = await GenInfo.tryDecodeStealth(imageData, mode);
+      if (result) results.push(result);
+    } catch { /* no stealth data in this channel */ }
+  }
+  return results;
+};
+
+/**
+ * Fetch image metadata.
+ * For PNG/WEBP: fetches full file to support stealth decoding.
+ * For JPEG: uses Range request (stealth doesn't apply).
  */
 GenInfo.fetchMetadata = async function (url, fileExt) {
-  const response = await fetch(url, {
-    headers: {
-      "Range": `bytes=0-${MAX_FETCH_BYTES - 1}`,
-    },
-  });
+  const supportsStealthFormats = ["png", "webp"];
+  const useRange = !supportsStealthFormats.includes(fileExt);
 
+  const headers = {};
+  if (useRange) {
+    headers["Range"] = "bytes=0-32767";
+  }
+
+  const response = await fetch(url, { headers });
   if (!response.ok) {
     throw new Error(`Failed to fetch: ${response.status}`);
   }
 
-  const buffer = await response.arrayBuffer();
+  const blob = await response.blob();
+  let chunks = [];
+
+  // Try stealth decoding for PNG/WEBP
+  if (supportsStealthFormats.includes(fileExt)) {
+    try {
+      chunks = await GenInfo.decodeStealthData(blob);
+    } catch { /* no stealth data */ }
+  }
+
+  const buffer = await blob.arrayBuffer();
 
   if (fileExt === "png") {
-    return GenInfo.parsePngChunks(buffer);
+    return chunks.concat(await GenInfo.parsePngChunks(buffer));
   }
-  return GenInfo.parseJpegUserComment(buffer);
+  if (fileExt === "jpg" || fileExt === "jpeg") {
+    return chunks.concat(GenInfo.parseJpegUserComment(buffer));
+  }
+
+  return chunks;
 };
 
 /**
@@ -228,7 +344,7 @@ GenInfo.getOriginalUrl = function () {
   if (!$container.length) return null;
 
   const fileExt = $container.data("file-ext");
-  if (!["png", "jpg", "jpeg"].includes(fileExt)) return null;
+  if (!["png", "jpg", "jpeg", "webp"].includes(fileExt)) return null;
 
   const postData = $container.data("post");
   const url = postData?.file?.url || null;
