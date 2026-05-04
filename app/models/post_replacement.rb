@@ -25,6 +25,7 @@ class PostReplacement < ApplicationRecord
     end
   end
   validate on: :create do |replacement|
+    next if replacement_file.nil?
     FileValidator.new(replacement, replacement_file.path, test_resolution: !is_backup).validate
     throw :abort if errors.any?
   end
@@ -342,7 +343,7 @@ class PostReplacement < ApplicationRecord
         q = q.where_user(:uploader_id_on_approve, %i[uploader_name_on_approve uploader_id_on_approve], params)
 
         if params[:post_id].present?
-          q = q.where("post_id in (?)", params[:post_id].split(",").first(100).map(&:to_i))
+          q = q.where("post_id in (?)", params[:post_id].split(",").first(Danbooru.config.max_per_page).map(&:to_i))
         end
 
         if params[:reason].present?

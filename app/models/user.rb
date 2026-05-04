@@ -94,7 +94,7 @@ class User < ApplicationRecord
   validates :name, presence: true # NOTE: validation order is important here. See UserNameValidator for details.
   validates :name, user_name: true, on: :create
   validates :default_image_size, inclusion: { in: %w[large fit fitv original] }
-  validates :per_page, inclusion: { in: 1..320 }
+  validates :per_page, inclusion: { in: 1..Danbooru.config.max_per_page }
   validates :comment_threshold, presence: true
   validates :comment_threshold, numericality: { only_integer: true, less_than: 50_000, greater_than: -50_000 }
   validates :password, length: { minimum: 8, if: ->(rec) { rec.new_record? || rec.password.present? || rec.old_password.present? } }
@@ -116,6 +116,10 @@ class User < ApplicationRecord
   after_create :create_user_status
   before_update :encrypt_password_on_update
   after_save :update_cache
+
+  after_create_commit :enqueue_automod_user_check
+  after_update_commit :enqueue_automod_user_update_check,
+                      if: -> { saved_change_to_name? || saved_change_to_profile_about? || saved_change_to_profile_artinfo? }
 
   has_many :api_keys, dependent: :destroy
   has_one :dmail_filter
@@ -165,6 +169,11 @@ class User < ApplicationRecord
     extend ActiveSupport::Concern
 
     module ClassMethods
+      # TODO: find_by_name overrides the Rails dynamic finder of the same name (User has a name column).
+      # find_by_name_or_id mimics the Rails dynamic finder naming convention but is purely custom.
+      # name_to_id, name_or_id_to_id, name_or_id_to_id_forced, and id_to_name are also custom with
+      # no Rails equivalent. All predate modern Rails conventions and add caching and custom ID syntax
+      # (e.g. !<id>). Do not rename or remove without understanding the callers first.
       def name_to_id(name)
         normalized_name = normalize_name(name)
         Cache.fetch("uni:#{normalized_name}", expires_in: 4.hours) do
@@ -1086,5 +1095,19 @@ class User < ApplicationRecord
     @feedback_pieces = nil
     @is_artist = nil
     self
+  end
+
+  private
+
+  def enqueue_automod_user_check
+    AutomodUserCheckJob.perform_later(id, check_username: true, check_profile: false)
+  end
+
+  def enqueue_automod_user_update_check
+    AutomodUserCheckJob.perform_later(
+      id,
+      check_username: saved_change_to_name?,
+      check_profile:  saved_change_to_profile_about? || saved_change_to_profile_artinfo?,
+    )
   end
 end

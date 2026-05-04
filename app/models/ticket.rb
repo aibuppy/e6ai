@@ -16,6 +16,8 @@ class Ticket < ApplicationRecord
   validates :reason, length: { minimum: 2, maximum: Danbooru.config.ticket_max_size }
   validates :response, length: { minimum: 2 }, on: :update
   enum :status, %i[pending partial approved].index_with(&:to_s)
+  after_create :push_pubsub_create
+  after_update :push_pubsub_update_notification
   after_update :log_update
   after_update :create_dmail
   validate :validate_content_exists, on: :create
@@ -243,6 +245,7 @@ class Ticket < ApplicationRecord
     end
 
     def validate_content_exists
+      return if qtype.blank?
       errors.add model.name.underscore.to_sym, "does not exist" if content.nil?
     end
 
@@ -276,7 +279,7 @@ class Ticket < ApplicationRecord
       if user.is_moderator?
         all
       elsif user.is_janitor?
-        for_creator(user.id).or(where.not(qtype: %w[Dmail User]))
+        for_creator(user.id).or(where.not(qtype: %w[dmail user]))
       else
         for_creator(user.id)
       end
@@ -326,7 +329,7 @@ class Ticket < ApplicationRecord
 
   def content=(new_content)
     @content = new_content
-    self.disp_id = content&.id
+    self.disp_id = new_content&.id
   end
 
   def content
@@ -444,6 +447,14 @@ class Ticket < ApplicationRecord
 
     def push_pubsub(action)
       Cache.redis.publish("ticket_updates", pubsub_hash(action).to_json)
+    end
+
+    def push_pubsub_create
+      push_pubsub("create")
+    end
+
+    def push_pubsub_update_notification
+      push_pubsub("update") if saved_change_to_status? || saved_change_to_response?
     end
   end
 

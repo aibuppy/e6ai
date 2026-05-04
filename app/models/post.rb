@@ -666,12 +666,13 @@ class Post < ApplicationRecord
         set_tag_string(((current_tags + new_tags) - old_tags + (current_tags & new_tags)).uniq.sort.join(" "))
       end
 
-      if old_parent_id == ""
-        old_parent_id = nil
-      else
-        old_parent_id = old_parent_id.to_i
-      end
-      if old_parent_id == parent_id
+      normalized_old_parent_id = if old_parent_id == ""
+                                   nil
+                                 else
+                                   old_parent_id.to_i
+                                 end
+
+      if normalized_old_parent_id == parent_id
         self.parent_id = parent_id_before_last_save || parent_id_was
       end
 
@@ -979,16 +980,19 @@ class Post < ApplicationRecord
 
         when /^child:none$/i
           children.each do |post|
+            remove_child_edit_reason(post)
             post.update!(parent_id: nil)
           end
 
         when /^-child:(.+)$/i
           children.numeric_attribute_matches(:id, $1).each do |post|
+            remove_child_edit_reason(post)
             post.update!(parent_id: nil)
           end
 
         when /^child:(.+)$/i
           Post.numeric_attribute_matches(:id, $1).where.not(id: id).limit(10).each do |post|
+            add_child_edit_reason(post)
             post.update!(parent_id: id)
           end
         end
@@ -1465,6 +1469,14 @@ class Post < ApplicationRecord
       return unless parent_id.present?
       parent.edit_reason = "Merged from post ##{self.id}"
     end
+
+    def remove_child_edit_reason(post)
+      post.edit_reason = "Removed as child of post ##{id}"
+    end
+
+    def add_child_edit_reason(post)
+      post.edit_reason = "Added as child of post ##{id}"
+    end
   end
 
   module DeletionMethods
@@ -1535,7 +1547,7 @@ class Post < ApplicationRecord
           errors.add(:base, "Cannot delete with given reason when no active flag exists.")
           return
         end
-        if pending_flag.reason =~ /uploading_guidelines/
+        if pending_flag.reason == PostFlag::MAPPED_REASONS["uploading_guidelines"]
           errors.add(:base, "Cannot delete with given reason when the flag is for uploading guidelines.")
           return
         end
@@ -1609,6 +1621,17 @@ class Post < ApplicationRecord
 
     def pending_flag
       flags.unresolved.order(id: :desc).first
+    end
+
+    def substitute_deletion_dmail_template(text, reason = nil)
+      return nil if text.blank?
+      if reason
+        text = text.gsub("%REASON%", reason)
+      end
+      text.gsub("%POST_ID%", id.to_s)
+          .gsub("%STAFF_NAME%", CurrentUser.name)
+          .gsub("%STAFF_ID%", CurrentUser.id.to_s)
+          .gsub("%UPLOADER_ID%", uploader_id.to_s)
     end
   end
 
@@ -1730,6 +1753,7 @@ class Post < ApplicationRecord
         score: score,
         fav_count: fav_count,
         is_favorited: favorited_by?(CurrentUser.user.id),
+        comment_count: comment_count,
 
         pools: pool_ids.join(" "),
       }
@@ -2088,7 +2112,7 @@ class Post < ApplicationRecord
   end
 
   def flaggable_for_guidelines?
-    !has_tag?("grandfathered_content") && created_at.after?("2015-01-01")
+    !has_tag?("grandfathered_content") && created_at.after?(Danbooru.config.grandfathered_post_cutoff)
   end
 
   def visible_comment_count(user)
