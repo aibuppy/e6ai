@@ -275,43 +275,42 @@ GenInfo.decodeStealthData = async function (blob) {
 
 /**
  * Fetch image metadata.
- * For PNG/WEBP: fetches full file to support stealth decoding.
- * For JPEG: uses Range request (stealth doesn't apply).
+ * First tries a Range request (32KB) to check for standard metadata.
+ * Falls back to a full fetch + stealth decoding only if nothing was found.
  */
 GenInfo.fetchMetadata = async function (url, fileExt) {
-  const supportsStealthFormats = ["png", "webp"];
-  const useRange = !supportsStealthFormats.includes(fileExt);
+  const canHaveStealth = fileExt === "png" || fileExt === "webp";
 
-  const headers = {};
-  if (useRange) {
-    headers["Range"] = "bytes=0-32767";
+  // Try Range request first for standard metadata (PNG chunks, EXIF)
+  if (fileExt !== "webp") {
+    const rangeResp = await fetch(url, { headers: { "Range": "bytes=0-32767" } });
+    if (!rangeResp.ok) throw new Error(`Failed to fetch: ${rangeResp.status}`);
+
+    const buffer = await rangeResp.arrayBuffer();
+    let chunks = [];
+
+    if (fileExt === "png") {
+      chunks = await GenInfo.parsePngChunks(buffer);
+    } else if (fileExt === "jpg" || fileExt === "jpeg") {
+      chunks = GenInfo.parseJpegUserComment(buffer);
+    }
+
+    if (chunks.length > 0) return chunks;
   }
 
-  const response = await fetch(url, { headers });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch: ${response.status}`);
-  }
+  // No standard metadata found (or webp) — try stealth decoding with full file
+  if (canHaveStealth) {
+    const fullResp = await fetch(url);
+    if (!fullResp.ok) throw new Error(`Failed to fetch: ${fullResp.status}`);
 
-  const blob = await response.blob();
-  let chunks = [];
-
-  // Try stealth decoding for PNG/WEBP
-  if (supportsStealthFormats.includes(fileExt)) {
+    const blob = await fullResp.blob();
     try {
-      chunks = await GenInfo.decodeStealthData(blob);
+      const stealthChunks = await GenInfo.decodeStealthData(blob);
+      if (stealthChunks.length > 0) return stealthChunks;
     } catch { /* no stealth data */ }
   }
 
-  const buffer = await blob.arrayBuffer();
-
-  if (fileExt === "png") {
-    return chunks.concat(await GenInfo.parsePngChunks(buffer));
-  }
-  if (fileExt === "jpg" || fileExt === "jpeg") {
-    return chunks.concat(GenInfo.parseJpegUserComment(buffer));
-  }
-
-  return chunks;
+  return [];
 };
 
 /**
